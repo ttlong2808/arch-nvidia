@@ -2,6 +2,7 @@
 # ============================================================
 #  NVIDIA RTX 5060 Ti - Arch Linux Driver Setup
 #  Supports: KDE Plasma + Hyprland (Wayland)
+#  Based on: https://wiki.archlinux.org/title/NVIDIA
 #  Usage: curl -fsSL https://get.tlprox.pro.vn/install.sh | sudo bash
 # ============================================================
 
@@ -21,20 +22,17 @@ step()  { echo -e "\n${BOLD}${GREEN}==>${RESET}${BOLD} $*${RESET}"; }
 # ════════════════════════════════════════════════════════════
 [[ $EUID -ne 0 ]] && err "Chạy script với sudo: sudo bash install.sh"
 
-# Detect real user
 REAL_USER="${SUDO_USER:-}"
 [[ -z "$REAL_USER" ]] && err "Chạy bằng: sudo bash install.sh (không dùng sudo su)"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 info "User: $REAL_USER | Home: $REAL_HOME"
 
-# Kiểm tra NVIDIA card có tồn tại không
 if ! lspci | grep -qi nvidia; then
     err "Không phát hiện NVIDIA card! Kiểm tra lại phần cứng."
 fi
 GPU_NAME=$(lspci | grep -i nvidia | head -1 | sed 's/.*: //')
 info "Phát hiện GPU: $GPU_NAME"
 
-# Detect bootloader
 detect_bootloader() {
     if [[ -d /boot/loader/entries ]] && ls /boot/loader/entries/*.conf &>/dev/null 2>&1; then
         echo "systemd-boot"
@@ -45,13 +43,11 @@ detect_bootloader() {
     fi
 }
 BOOTLOADER=$(detect_bootloader)
-info "Bootloader: $BOOTLOADER"
-
 CURRENT_KERNEL=$(uname -r)
-info "Kernel: $CURRENT_KERNEL"
+info "Bootloader: $BOOTLOADER | Kernel: $CURRENT_KERNEL"
 
 # ════════════════════════════════════════════════════════════
-step "1/9  Bật multilib repo"
+step "1/10  Bật multilib repo + ParallelDownloads"
 # ════════════════════════════════════════════════════════════
 PACMAN_CONF="/etc/pacman.conf"
 
@@ -76,26 +72,23 @@ info "Sync package database..."
 pacman -Sy --noconfirm
 
 # ════════════════════════════════════════════════════════════
-step "2/9  Cài yay (AUR helper)"
+step "2/10  Cài yay (AUR helper)"
 # ════════════════════════════════════════════════════════════
 if command -v yay &>/dev/null; then
     info "yay đã cài"
 else
-    info "Cài dependencies..."
     pacman -S --noconfirm --needed git base-devel
-
     YAY_TMP=$(mktemp -d)
     git clone --depth 1 https://aur.archlinux.org/yay-bin.git "$YAY_TMP"
     cd "$YAY_TMP"
     sudo -u "$REAL_USER" makepkg -si --noconfirm
     cd /
     rm -rf "$YAY_TMP"
-
     command -v yay &>/dev/null && ok "Đã cài yay" || warn "yay cài thất bại — sẽ dùng pacman"
 fi
 
 # ════════════════════════════════════════════════════════════
-step "3/9  Gỡ driver NVIDIA cũ"
+step "3/10  Gỡ driver NVIDIA cũ"
 # ════════════════════════════════════════════════════════════
 OLD_PKGS=()
 for pkg in nvidia nvidia-dkms nvidia-open nvidia-open-dkms; do
@@ -111,12 +104,15 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
-step "4/9  Cài NVIDIA driver"
+step "4/10  Cài NVIDIA driver"
 # ════════════════════════════════════════════════════════════
+# RTX 5060 Ti (Blackwell) bắt buộc open kernel module
+# nvidia-open     → kernel linux/linux-lts chuẩn
+# nvidia-open-dkms → custom kernel (linux-zen, linux-cachyos, v.v.)
 NVIDIA_UTILS=(nvidia-utils lib32-nvidia-utils nvidia-settings)
 DRIVER_INSTALLED=""
 
-info "Thử cài nvidia-open (cho kernel chuẩn)..."
+info "Thử cài nvidia-open..."
 if pacman -S --noconfirm --needed nvidia-open "${NVIDIA_UTILS[@]}" 2>/dev/null; then
     DRIVER_INSTALLED="nvidia-open"
     ok "Đã cài nvidia-open"
@@ -132,24 +128,37 @@ else
                 DRIVER_INSTALLED="nvidia-open-beta"
                 ok "Đã cài nvidia-open-beta"
             else
-                err "Tất cả driver đều thất bại. Kiểm tra kết nối mạng và thử lại."
+                err "Tất cả driver đều thất bại. Kiểm tra kết nối mạng."
             fi
         else
             err "Cài driver thất bại. Chạy tay: pacman -S nvidia-open-dkms nvidia-utils lib32-nvidia-utils"
         fi
     fi
 fi
-
-info "Driver đã cài: $DRIVER_INSTALLED"
+info "Driver: $DRIVER_INSTALLED"
 
 # ════════════════════════════════════════════════════════════
-step "5/9  Blacklist nouveau"
+step "5/10  Blacklist nouveau"
 # ════════════════════════════════════════════════════════════
+# nvidia-utils đã tự blacklist nouveau khi reboot
+# Thêm file này để đảm bảo nouveau không load trong early boot
 cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
 blacklist nouveau
 options nouveau modeset=0
 EOF
 ok "Đã blacklist nouveau"
+
+# Xóa kms khỏi HOOKS để nouveau không load trong initramfs
+# Arch Wiki: "remove kms from HOOKS array in /etc/mkinitcpio.conf"
+MKINITCPIO_CONF="/etc/mkinitcpio.conf"
+if grep -q "^HOOKS=.*\bkms\b" "$MKINITCPIO_CONF"; then
+    sed -i 's/\(HOOKS=([^)]*\)\bkms\b/\1/' "$MKINITCPIO_CONF"
+    # Dọn double space nếu có
+    sed -i '/^HOOKS=/s/  / /g' "$MKINITCPIO_CONF"
+    ok "Đã xóa kms khỏi HOOKS (ngăn nouveau load sớm)"
+else
+    info "kms không có trong HOOKS hoặc đã được xóa"
+fi
 
 if lsmod | grep -q "^nouveau"; then
     modprobe -r nouveau 2>/dev/null && info "Đã unload nouveau" || \
@@ -157,10 +166,48 @@ if lsmod | grep -q "^nouveau"; then
 fi
 
 # ════════════════════════════════════════════════════════════
-step "6/9  Bật DRM kernel mode setting"
+step "6/10  Thêm NVIDIA modules vào initramfs"
 # ════════════════════════════════════════════════════════════
+# Arch Wiki: thêm nvidia nvidia_modeset nvidia_uvm nvidia_drm vào MODULES
+# để đảm bảo load trước display manager, tránh black screen
+NVIDIA_MODULES="nvidia nvidia_modeset nvidia_uvm nvidia_drm"
+
+if grep -q "^MODULES=(" "$MKINITCPIO_CONF"; then
+    CURRENT_MODULES=$(grep "^MODULES=(" "$MKINITCPIO_CONF" | sed 's/MODULES=(\(.*\))/\1/')
+    NEEDS_UPDATE=false
+
+    for mod in $NVIDIA_MODULES; do
+        if ! echo "$CURRENT_MODULES" | grep -qw "$mod"; then
+            NEEDS_UPDATE=true
+            break
+        fi
+    done
+
+    if $NEEDS_UPDATE; then
+        # Thêm vào đầu MODULES array
+        sed -i "s/^MODULES=(\(.*\))/MODULES=($NVIDIA_MODULES \1)/" "$MKINITCPIO_CONF"
+        # Dọn double space
+        sed -i '/^MODULES=/s/  \+/ /g' "$MKINITCPIO_CONF"
+        ok "Đã thêm NVIDIA modules vào /etc/mkinitcpio.conf"
+    else
+        info "NVIDIA modules đã có trong MODULES"
+    fi
+else
+    # Không tìm thấy dòng MODULES, thêm mới
+    echo "MODULES=($NVIDIA_MODULES)" >> "$MKINITCPIO_CONF"
+    ok "Đã thêm MODULES vào mkinitcpio.conf"
+fi
+
+info "MODULES hiện tại: $(grep '^MODULES=' $MKINITCPIO_CONF)"
+
+# ════════════════════════════════════════════════════════════
+step "7/10  Bật DRM kernel mode setting"
+# ════════════════════════════════════════════════════════════
+# Driver >= 560 tự bật modeset=1, nhưng vẫn set để chắc chắn
+# NVreg_PreserveVideoMemoryAllocations=1 cần cho suspend/resume
 cat > /etc/modprobe.d/nvidia.conf <<'EOF'
 options nvidia-drm modeset=1
+options nvidia-drm fbdev=1
 options nvidia NVreg_PreserveVideoMemoryAllocations=1
 EOF
 ok "Đã tạo /etc/modprobe.d/nvidia.conf"
@@ -178,7 +225,8 @@ case "$BOOTLOADER" in
         ;;
     systemd-boot)
         for ENTRY in /boot/loader/entries/*.conf; do
-            if grep -q "nvidia-drm.modeset=1" "$ENTRY" 2>/dev/null; then
+            [[ -f "$ENTRY" ]] || continue
+            if grep -q "nvidia-drm.modeset=1" "$ENTRY"; then
                 info "Đã có trong $ENTRY"
             else
                 sed -i '/^options/s/$/ nvidia-drm.modeset=1/' "$ENTRY"
@@ -192,30 +240,47 @@ case "$BOOTLOADER" in
 esac
 
 # ════════════════════════════════════════════════════════════
-step "7/9  Detect PCI path của NVIDIA card"
+step "8/10  Tạo pacman hook tự rebuild initramfs khi update driver"
+# ════════════════════════════════════════════════════════════
+# Arch Wiki: tạo hook để mkinitcpio -P chạy tự động sau mỗi lần
+# NVIDIA driver được install/upgrade/remove
+mkdir -p /etc/pacman.d/hooks
+
+cat > /etc/pacman.d/hooks/nvidia.hook <<EOF
+[Trigger]
+Operation=Install
+Operation=Upgrade
+Operation=Remove
+Type=Package
+Target=$DRIVER_INSTALLED
+Target=nvidia-utils
+
+[Action]
+Description=Rebuilding initramfs after NVIDIA driver update...
+Depends=mkinitcpio
+When=PostTransaction
+Exec=/usr/bin/mkinitcpio -P
+EOF
+ok "Đã tạo /etc/pacman.d/hooks/nvidia.hook"
+
+# ════════════════════════════════════════════════════════════
+step "9/10  Detect PCI path + Tạo Hyprland env config"
 # ════════════════════════════════════════════════════════════
 NVIDIA_PCI_ID=$(lspci | grep -i nvidia | head -1 | awk '{print $1}')
-NVIDIA_PCI_FULL="0000:${NVIDIA_PCI_ID}"
-info "NVIDIA PCI ID: $NVIDIA_PCI_FULL"
+info "NVIDIA PCI ID: $NVIDIA_PCI_ID"
 
 NVIDIA_DRI_PATH=""
 if [[ -d /dev/dri/by-path ]]; then
-    MATCH=$(ls -la /dev/dri/by-path/ 2>/dev/null \
-        | grep "${NVIDIA_PCI_ID}-card" \
-        | grep -o 'pci-[^ ]*card' | head -1)
+    MATCH=$(ls /dev/dri/by-path/ 2>/dev/null \
+        | grep "${NVIDIA_PCI_ID}-card$" | head -1)
     if [[ -n "$MATCH" ]]; then
         NVIDIA_DRI_PATH="/dev/dri/by-path/${MATCH}"
         ok "DRI path: $NVIDIA_DRI_PATH"
     fi
 fi
+[[ -z "$NVIDIA_DRI_PATH" ]] && warn "DRI path chưa sẵn sàng — sẽ tự cập nhật sau reboot"
 
-if [[ -z "$NVIDIA_DRI_PATH" ]]; then
-    warn "/dev/dri/by-path chưa sẵn sàng — sẽ tự cập nhật sau reboot qua systemd service"
-fi
-
-# ════════════════════════════════════════════════════════════
-step "8/9  Tạo Hyprland env config"
-# ════════════════════════════════════════════════════════════
+# Tạo Hyprland nvidia.conf
 HYPR_DIR="$REAL_HOME/.config/hypr"
 mkdir -p "$HYPR_DIR"
 
@@ -227,7 +292,8 @@ fi
 
 cat > "$HYPR_DIR/nvidia.conf" <<EOF
 # NVIDIA env vars cho Hyprland
-# Tạo tự động bởi install.sh — chạy lại install.sh để cập nhật
+# Tạo tự động bởi install.sh — based on wiki.hyprland.org/Nvidia
+# Chạy lại install.sh để cập nhật
 
 env = LIBVA_DRIVER_NAME,nvidia
 env = __GLX_VENDOR_LIBRARY_NAME,nvidia
@@ -269,20 +335,16 @@ HYPREOF
     ok "Đã tạo hyprland.conf tối thiểu"
 fi
 
-# ── Post-boot systemd service để tự điền AQ_DRM_DEVICES ─────
-# (chạy sau mỗi boot khi /dev/dri/by-path đã sẵn sàng)
-SCRIPT_PATH="/usr/local/bin/nvidia-hypr-path.sh"
+# Post-boot service tự cập nhật AQ_DRM_DEVICES
 STORED_PCI="$NVIDIA_PCI_ID"
 STORED_CONF="$HYPR_DIR/nvidia.conf"
 
-cat > "$SCRIPT_PATH" <<SHEOF
+cat > /usr/local/bin/nvidia-hypr-path.sh <<SHEOF
 #!/usr/bin/env bash
 NVIDIA_PCI="${STORED_PCI}"
 NVIDIA_CONF="${STORED_CONF}"
 
-MATCH=\$(ls -la /dev/dri/by-path/ 2>/dev/null \\
-    | grep "\${NVIDIA_PCI}-card" \\
-    | grep -o 'pci-[^ ]*card' | head -1)
+MATCH=\$(ls /dev/dri/by-path/ 2>/dev/null | grep "\${NVIDIA_PCI}-card\$" | head -1)
 
 if [[ -n "\$MATCH" ]]; then
     FULL_PATH="/dev/dri/by-path/\${MATCH}"
@@ -296,7 +358,7 @@ else
     echo "[nvidia-hypr-path] Không tìm thấy DRI path cho PCI \${NVIDIA_PCI}"
 fi
 SHEOF
-chmod +x "$SCRIPT_PATH"
+chmod +x /usr/local/bin/nvidia-hypr-path.sh
 
 cat > /etc/systemd/system/nvidia-hypr-path.service <<'SVCEOF'
 [Unit]
@@ -317,8 +379,9 @@ systemctl enable nvidia-hypr-path.service 2>/dev/null
 ok "Đã tạo nvidia-hypr-path.service"
 
 # ════════════════════════════════════════════════════════════
-step "9/9  Bật NVIDIA services + Rebuild initramfs"
+step "10/10  Bật NVIDIA services + Rebuild initramfs"
 # ════════════════════════════════════════════════════════════
+# Arch Wiki: bật suspend/resume services để tránh màn đen sau wake
 for svc in nvidia-suspend nvidia-resume nvidia-hibernate; do
     if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}.service"; then
         systemctl enable "$svc" 2>/dev/null && ok "Enabled $svc" || true
@@ -328,6 +391,13 @@ done
 info "Rebuild initramfs (1-2 phút)..."
 mkinitcpio -P
 ok "Initramfs đã rebuild"
+
+# ════════════════════════════════════════════════════════════
+# Verify DRM sau khi cài
+# ════════════════════════════════════════════════════════════
+info "Kiểm tra DRM modeset..."
+DRM_STATUS=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo "N/A (cần reboot)")
+info "DRM modeset: $DRM_STATUS"
 
 # ════════════════════════════════════════════════════════════
 # SUMMARY
@@ -341,17 +411,21 @@ echo -e "  GPU:      \033[0;36m${GPU_NAME}\033[0m"
 echo -e "  Driver:   \033[0;36m${DRIVER_INSTALLED}\033[0m"
 echo -e "  Kernel:   \033[0;36m${CURRENT_KERNEL}\033[0m"
 echo -e "  Boot:     \033[0;36m${BOOTLOADER}\033[0m"
+echo -e "  DRM:      \033[0;36m${DRM_STATUS}\033[0m"
 [[ -n "$NVIDIA_DRI_PATH" ]] && echo -e "  DRI:      \033[0;36m${NVIDIA_DRI_PATH}\033[0m"
 echo ""
-echo -e "  \033[1mSau reboot, kiểm tra:\033[0m"
-echo -e "  \033[0;36mnvidia-smi\033[0m                    → thông tin card"
-echo -e "  \033[0;36mcat /proc/driver/nvidia/version\033[0m → driver version"
-echo -e "  \033[0;36mlspci -k | grep -A3 -i nvidia\033[0m  → kernel module"
-echo -e "  \033[0;36mls /dev/dri/by-path/\033[0m           → DRI path"
+echo -e "  \033[1mSau reboot, verify:\033[0m"
+echo -e "  \033[0;36mnvidia-smi\033[0m"
+echo -e "  \033[0;36mcat /sys/module/nvidia_drm/parameters/modeset\033[0m  → phải ra Y"
+echo -e "  \033[0;36mcat /sys/module/nvidia_drm/parameters/fbdev\033[0m    → phải ra Y"
+echo -e "  \033[0;36mlspci -k | grep -A3 -i nvidia\033[0m"
+echo -e "  \033[0;36mls /dev/dri/by-path/\033[0m"
 echo ""
-echo -e "  \033[1mCấu hình 2 màn hình (Hyprland):\033[0m"
-echo -e "  \033[0;36mhyprctl monitors\033[0m  → xem tên & resolution"
-echo -e "  Sửa: \033[0;36m~/.config/hypr/hyprland.conf\033[0m"
+echo -e "  \033[1mPacman hook đã tạo:\033[0m"
+echo -e "  /etc/pacman.d/hooks/nvidia.hook → tự rebuild initramfs khi update driver"
+echo ""
+echo -e "  \033[1mHyprland config:\033[0m"
+echo -e "  \033[0;36m~/.config/hypr/nvidia.conf\033[0m"
 echo ""
 
 read -rp "$(echo -e "\033[1;33mReboot ngay? [Y/n]: \033[0m")" REBOOT_NOW
